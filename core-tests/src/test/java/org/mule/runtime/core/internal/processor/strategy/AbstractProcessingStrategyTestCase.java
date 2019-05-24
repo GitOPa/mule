@@ -37,10 +37,10 @@ import static org.mule.tck.probe.PollingProber.DEFAULT_POLLING_INTERVAL;
 import static org.mule.tck.probe.PollingProber.DEFAULT_TIMEOUT;
 import static org.slf4j.LoggerFactory.getLogger;
 import static reactor.core.Exceptions.bubble;
+import static reactor.core.Exceptions.propagate;
 import static reactor.core.publisher.Flux.from;
 import static reactor.core.publisher.Mono.just;
 import static reactor.core.scheduler.Schedulers.fromExecutorService;
-
 import org.mule.runtime.api.component.AbstractComponent;
 import org.mule.runtime.api.component.location.ComponentLocation;
 import org.mule.runtime.api.exception.MuleException;
@@ -71,18 +71,6 @@ import org.mule.tck.junit4.AbstractMuleContextTestCase;
 import org.mule.tck.probe.JUnitLambdaProbe;
 import org.mule.tck.probe.PollingProber;
 
-import org.hamcrest.Matcher;
-import org.hamcrest.TypeSafeMatcher;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Rule;
-import org.junit.Test;
-import org.junit.rules.ExpectedException;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
-import org.reactivestreams.Publisher;
-import org.slf4j.Logger;
-
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashSet;
@@ -104,8 +92,18 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
+import org.hamcrest.Matcher;
+import org.hamcrest.TypeSafeMatcher;
+import org.junit.After;
+import org.junit.Before;
+import org.junit.Rule;
+import org.junit.Test;
+import org.junit.rules.ExpectedException;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
+import org.reactivestreams.Publisher;
+import org.slf4j.Logger;
 import reactor.core.publisher.Flux;
-import reactor.core.publisher.Mono;
 
 @RunWith(Parameterized.class)
 public abstract class AbstractProcessingStrategyTestCase extends AbstractMuleContextTestCase {
@@ -506,12 +504,19 @@ public abstract class AbstractProcessingStrategyTestCase extends AbstractMuleCon
       case FLOW:
         return flow.process(event);
       case SOURCE:
-        Publisher<CoreEvent> responsePublisher = ((BaseEventContext) event.getContext()).getResponsePublisher();
-        just(event)
-            .transform(triggerableMessageSource.getListener())
-            .subscribe(requestUnbounded());
         try {
-          return Mono.from(responsePublisher).block();
+          return just(event)
+              .doOnNext(innerEvent -> flow.checkBackpressure(innerEvent))
+              .onErrorMap(FlowBackPressureException.class,
+                          backpressureException -> {
+                            try {
+                              return new MessagingException(newEvent(), backpressureException);
+                            } catch (MuleException e) {
+                              throw propagate(e);
+                            }
+                          })
+              .transform(triggerableMessageSource.getListener())
+              .block();
         } catch (Throwable throwable) {
           throw rxExceptionToMuleException(throwable);
         }
@@ -594,7 +599,17 @@ public abstract class AbstractProcessingStrategyTestCase extends AbstractMuleCon
 
       for (int i = 0; i < STREAM_ITERATIONS; i++) {
         cachedThreadPool.submit(() -> Flux.just(newEvent())
-            .cast(CoreEvent.class).transform(triggerableMessageSource.getListener())
+            .cast(CoreEvent.class)
+            .doOnNext(event -> flow.checkBackpressure(event))
+            .onErrorMap(FlowBackPressureException.class,
+                        backpressureException -> {
+                          try {
+                            return new MessagingException(newEvent(), backpressureException);
+                          } catch (MuleException e) {
+                            throw propagate(e);
+                          }
+                        })
+            .transform(triggerableMessageSource.getListener())
             .doOnNext(event -> processed.getAndIncrement())
             .doOnError(e -> rejected.getAndIncrement()).subscribe());
         if (i == STREAM_ITERATIONS / 2) {
